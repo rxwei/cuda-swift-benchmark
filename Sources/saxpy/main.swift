@@ -2,6 +2,7 @@ import NVRTC
 import CUDARuntime
 import Foundation
 import Dispatch
+import CuBLAS
 
 guard let device = Device.current else {
     print("No CUDA device available")
@@ -9,10 +10,16 @@ guard let device = Device.current else {
 }
 
 /// Iterations
-let iterationCount = 10
+let iterationCount = 50
 let n: Int = 1 << 21
 print("Iteration count: \(iterationCount)")
 print("Vector size: n = \(n)")
+
+/// Load cuBLAS
+let blasLoadingStart = DispatchTime.now().uptimeNanoseconds
+_ = BLAS.main
+let blasLoadingTime = DispatchTime.now().uptimeNanoseconds - blasLoadingStart
+print("cuBLAS loading time: \(blasLoadingTime)")
 
 /// Compile kernel
 let compileStart = DispatchTime.now().uptimeNanoseconds
@@ -26,6 +33,7 @@ let module = try Module(source: daxpySource, compileOptions: [
     .useFastMath
 ])
 let compileTime = DispatchTime.now().uptimeNanoseconds - compileStart
+let daxpy = module.function(named: "daxpy")!
 print("Kernel compile+load time: \(compileTime)")
 
 /// Host data
@@ -36,22 +44,12 @@ var hostResult = Array<Double>(repeating: 0, count: n)
 
 /// Device data
 let h2dStart = DispatchTime.now().uptimeNanoseconds
+let deviceA = DeviceValue(a)
 var x = DeviceArray<Double>(fromHost: hostX)
 var y = DeviceArray<Double>(fromHost: hostY)
 var result = DeviceArray<Double>(capacity: n)
 let h2dTime = DispatchTime.now().uptimeNanoseconds - h2dStart
 print("Host-to-device memcpy time: \(h2dTime)")
-
-let daxpy = module.function(named: "daxpy")!
-
-
-/// Add arguments to a list
-var args = ArgumentList()
-args.append(Int32(n))    /// count
-args.append(a)           /// a
-args.append(&x)          /// X
-args.append(&y)          /// Y
-args.append(&result)     /// Z
 
 /// Run on CPU
 print("Running daxpy on CPU...")
@@ -65,9 +63,27 @@ for _ in 0..<iterationCount {
 let cpuTime = DispatchTime.now().uptimeNanoseconds - cpuStart
 print("Time: \(cpuTime)")
 
-print("Running daxpy on GPU...")
+/// Copy Y to Z for BLAS
+result = y
+/// Run on BLAS
+print("Running daxpy on GPU using cuBLAS...")
+let blasStart = DispatchTime.now().uptimeNanoseconds
+for _ in 0..<iterationCount {
+    BLAS.main.add(x, multipliedBy: deviceA, onto: &result)
+}
+let blasTime = DispatchTime.now().uptimeNanoseconds - blasStart
+print("Time: \(blasTime)")
+
 
 /// Run on GPU
+/// Add arguments to a list
+print("Running daxpy on GPU using compiled kernel...")
+var args = ArgumentList()
+args.append(Int32(n))    /// count
+args.append(a)           /// a
+args.append(&x)          /// X
+args.append(&y)          /// Y
+args.append(&result)     /// Z
 let gpuStart = DispatchTime.now().uptimeNanoseconds
 for _ in 0..<iterationCount {
     try daxpy<<<(n/256, 256)>>>(args)
@@ -75,4 +91,4 @@ for _ in 0..<iterationCount {
 let gpuTime = DispatchTime.now().uptimeNanoseconds - gpuStart
 print("Time: \(gpuTime)")
 
-print("GPU is \(Float(cpuTime)/Float(gpuTime)) times faster than CPU")
+print("Compiled GPU kernel is \(Float(cpuTime)/Float(gpuTime))x faster than CPU, and \(Float(blasTime)/Float(gpuTime))x faster than cuBLAS")
