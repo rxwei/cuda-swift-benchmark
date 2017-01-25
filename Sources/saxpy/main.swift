@@ -1,32 +1,31 @@
 import NVRTC
-import CUDARuntime
+import CUDADriver
 import Foundation
 import Dispatch
 import CuBLAS
+import Warp
 
-guard let device = Device.current else {
-    print("No CUDA device available")
-    exit(1)
-}
+let device = Device.current
+print(device.computeCapability)
 
 /// Iterations
-let iterationCount = 50
+let iterationCount = 100
 let n: Int = 1 << 21
 print("Iteration count: \(iterationCount)")
 print("Vector size: n = \(n)")
 
 /// Load cuBLAS
 let blasLoadingStart = DispatchTime.now().uptimeNanoseconds
-_ = BLAS.main
+let blas = BLAS.global(on: device)
 let blasLoadingTime = DispatchTime.now().uptimeNanoseconds - blasLoadingStart
 print("cuBLAS loading time: \(blasLoadingTime)")
 
 /// Compile kernel
 let compileStart = DispatchTime.now().uptimeNanoseconds
 let daxpySource =
-    "extern \"C\" __global__ void daxpy(size_t n, double a, double *x, double *y, double *z) {"
-  + "    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;"
-  + "    if (tid < n) z[tid] = a * x[tid] + y[tid];"
+    "extern \"C\" __global__ void daxpy(long long n, double a, double *x, double *y, double *z) {"
+  + "    long long tid = blockIdx.x * blockDim.x + threadIdx.x;"
+  + "    if (tid < n) { z[tid] = a * x[tid] + y[tid]; }"
   + "}"
 let module = try Module(source: daxpySource, compileOptions: [
     .computeCapability(device.computeCapability),
@@ -44,12 +43,16 @@ var hostResult = Array<Double>(repeating: 0, count: n)
 
 /// Device data
 let h2dStart = DispatchTime.now().uptimeNanoseconds
-let deviceA = DeviceValue(a)
-var x = DeviceArray<Double>(fromHost: hostX)
-var y = DeviceArray<Double>(fromHost: hostY)
+var x = DeviceArray(hostX)
+var y = DeviceArray(hostY)
 var result = DeviceArray<Double>(capacity: n)
 let h2dTime = DispatchTime.now().uptimeNanoseconds - h2dStart
 print("Host-to-device memcpy time: \(h2dTime)")
+
+print("Preparing Warp kernel...")
+result.assign(from: .addition,
+              left: x, multipliedBy: a,
+              right: y)
 
 /// Run on CPU
 print("Running daxpy on CPU...")
@@ -64,12 +67,15 @@ let cpuTime = DispatchTime.now().uptimeNanoseconds - cpuStart
 print("Time: \(cpuTime)")
 
 /// Copy Y to Z for BLAS
-result = y
+result = DeviceArray(y)
 /// Run on BLAS
 print("Running daxpy on GPU using cuBLAS...")
 let blasStart = DispatchTime.now().uptimeNanoseconds
 for _ in 0..<iterationCount {
-    BLAS.main.add(x, multipliedBy: deviceA, onto: &result)
+    blas.axpy(alpha: a,
+              x: x.unsafeDevicePointer, stride: 1,
+              y: result.unsafeMutableDevicePointer, stride: 1,
+              count: Int32(x.count))
 }
 let blasTime = DispatchTime.now().uptimeNanoseconds - blasStart
 print("Time: \(blasTime)")
@@ -78,17 +84,28 @@ print("Time: \(blasTime)")
 /// Run on GPU
 /// Add arguments to a list
 print("Running daxpy on GPU using compiled kernel...")
-var args = ArgumentList()
-args.append(Int32(n))    /// count
-args.append(a)           /// a
-args.append(&x)          /// X
-args.append(&y)          /// Y
-args.append(&result)     /// Z
 let gpuStart = DispatchTime.now().uptimeNanoseconds
 for _ in 0..<iterationCount {
-    try daxpy<<<(n/256, 256)>>>(args)
+    try daxpy<<<(n/256, 256)>>>[
+        .longLong(Int64(n)),         // count
+        .double(a),           // alpha
+        .constPointer(to: x), // &x
+        .constPointer(to: y), // &y
+        .pointer(to: &result) // &result
+    ]
 }
 let gpuTime = DispatchTime.now().uptimeNanoseconds - gpuStart
 print("Time: \(gpuTime)")
 
-print("Compiled GPU kernel is \(Float(cpuTime)/Float(gpuTime))x faster than CPU, and \(Float(blasTime)/Float(gpuTime))x faster than cuBLAS")
+/// Run using Warp library (which is based on compiled kernels)
+print("Running daxpy on GPU using Warp library")
+let warpStart = DispatchTime.now().uptimeNanoseconds
+for _ in 0..<iterationCount {
+    result.assign(from: .addition,
+                  left: x, multipliedBy: a,
+                  right: y)
+}
+let warpTime = DispatchTime.now().uptimeNanoseconds - warpStart
+print("Time: \(warpTime)")
+
+print("Compiled GPU kernel is \(Float(cpuTime)/Float(gpuTime))x faster than CPU, and \(Float(blasTime)/Float(gpuTime))x faster than cuBLAS, \(Float(warpTime)/Float(gpuTime))x faster than Warp.")
